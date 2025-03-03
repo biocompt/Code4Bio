@@ -1,0 +1,9 @@
+name: bwa-mem2_v.2.2.1
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bwa-mem2=2.2.1
+  - gatk4=4.2.6.1
+  - samtools=1.18
+  - htslib=1.17
