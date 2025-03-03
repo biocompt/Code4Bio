@@ -1,0 +1,165 @@
+##################################################################
+###     HRD Score Calculation in Paired Tumor-Control Samples  ###
+##################################################################
+
+# This Snakemake workflow automates the calculation of Homologous Recombination Deficiency (HRD) scores from paired tumor-control DNA sequencing data.
+# HRD is a genomic instability biomarker associated with deficiencies in DNA repair mechanisms. The pipeline processes raw FASTQ files through quality control, alignment, variant calling, and HRD scoring,
+# leveraging established bioinformatics tools.
+import yaml
+
+csv_file = config.get("csv_file")
+data_dir = config.get("data_dir")
+user_slurm = config.get("user_slurm")
+
+shell(f"python utilities/scripts/generate_config.py --csv_file {csv_file} --data_dir {data_dir} --user_slurm {user_slurm} --config_file utilities/snakeconfig.yaml")
+shell(f"bash utilities/scripts/download-reference-genomes.sh")
+
+yaml_file_path = 'utilities/snakeconfig.yaml'
+with open(yaml_file_path, 'r') as file:
+    config = yaml.safe_load(file)
+
+SAMPLES = list(config["samples"].keys())
+TYPE = list(next(iter(config["samples"].values())).keys())
+
+localrules: all, hrd_score
+rule all:
+        input:
+                trim = expand('results/{S}/{S}_{T}_trimmed_{N}.fastq.gz', S=SAMPLES, T=TYPE, N=['1','2']),
+                align = expand('results/{S}/{S}_{T}.bam', S=SAMPLES, T=TYPE),
+                sequenza = expand('results/{S}/{S}.small.seqz.gz', S=SAMPLES),
+                hrd_score = expand('results/{S}_HRD_score.txt', S=SAMPLES)
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- #
+#                                                                                       3. RUN ANALYSIS                                            #
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- #
+
+# Processing ARN samples: from fastq to bam
+rule trim:
+        input:
+                r1=lambda wildcards: config["samples"][wildcards.S][wildcards.T][0],
+                r2=lambda wildcards: config["samples"][wildcards.S][wildcards.T][1]
+        output:
+                r1='results/{S}/{S}_{T}_trimmed_1.fastq.gz',
+                r2='results/{S}/{S}_{T}_trimmed_2.fastq.gz',
+                report_html='results/{S}/trim/{S}_{T}_trimming_report.html'
+        resources:
+                runtime=75,
+                cpus_per_task=3,
+                mem_mb=4800,
+                account=config['resources']['user_cesga']
+        conda:
+                config['software']['fastp']
+        resources:
+                runtime=45,
+                cpus_per_task=4,
+                mem_mb=24000,
+                account=config['resources']['user_cesga']
+        threads: 8
+        shell:
+                """
+		mkdir -p results/{wildcards.S}/trim
+
+                fastp -i {input.r1} -I {input.r2} --cut_front --cut_tail --cut_right \
+                --cut_window_size 5 --cut_mean_quality 20 --length_required 36 --trim_poly_g --trim_poly_x --thread {threads} \
+                -h {output.report_html} -R "QC for {wildcards.S}" -o {output.r1} -O {output.r2}
+                
+                rm fastp*
+                """
+rule index_genome:
+        input:
+                config['ref']['ref_fa']
+        output:
+                idx=multiext("utilities/reference-genomes/GRCh38.primary_assembly.genome.fa", ".amb", ".ann", ".bwt.2bit.64", ".fai", ".dict", ".pac", ".0123")
+        resources:
+                runtime=840,
+                cpus_per_task=8,
+                mem_mb=84000,
+                account=config['resources']['user_cesga']
+        conda:
+                config['software']['bwa']
+        shell:
+                """
+                bwa-mem2 index {input}
+                samtools faidx {input}
+		gatk CreateSequenceDictionary -R {input} -O utilities/reference-genomes/GRCh38.primary_assembly.genome.fa.dict
+                """
+rule gc_wiggle:
+        input:
+                ref=config['ref']['ref_fa']
+        output:
+                gc='utilities/reference-genomes/GRCh38.primary_assembly.gc50Base.wig.gz'
+        resources:
+                runtime=90,
+                cpus_per_task=2,
+                mem_mb=8000,
+                account=config['resources']['user_cesga']
+        conda:
+                config['software']['sequenza']
+        shell:
+                """
+                sequenza-utils gc_wiggle --fasta {input.ref} -w 50 -o utilities/reference-genomes/GRCh38.primary_assembly.gc50Base.wig.gz
+                """   
+rule align:
+        input:
+                r1='results/{S}/{S}_{T}_trimmed_1.fastq.gz',
+                r2='results/{S}/{S}_{T}_trimmed_2.fastq.gz',
+                idx=multiext("utilities/reference-genomes/GRCh38.primary_assembly.genome.fa", ".amb", ".ann", ".bwt.2bit.64", ".pac", ".0123"),
+                ref=config['ref']['ref_fa'],
+                known=config['ref']['known_indels'],
+                standard=config['ref']['standard_indels']
+        output:
+                'results/{S}/{S}_{T}.bam'
+        resources:
+                runtime=920,
+                cpus_per_task=8,
+                mem_mb=64000,
+                account=config['resources']['user_cesga']
+        conda:
+                config['software']['bwa']
+        threads: 64
+        shell:
+                 """
+                bwa-mem2 mem -t {threads} -v 1 {input.ref} {input.r1} {input.r2} | \
+                samtools fixmate -u -m - - | samtools sort -T results/{wildcards.S}/tmp_{wildcards.S}_{wildcards.T} - | \
+                samtools markdup - - | samtools view -h -q 10 -b - > results/{wildcards.S}/{wildcards.S}_{wildcards.T}_sorted.bam
+                
+                gatk AddOrReplaceReadGroups I=results/{wildcards.S}/{wildcards.S}_{wildcards.T}_sorted.bam O=results/{wildcards.S}/tmp_{wildcards.S}_{wildcards.T}.bam RGID={wildcards.S} RGPL=ILLUMINA RGLB=TruSeq RGPU=unit1 RGSM={wildcards.S}
+                gatk BaseRecalibrator -I results/{wildcards.S}/tmp_{wildcards.S}_{wildcards.T}.bam -R {input.ref} --known-sites {input.known} --known-sites {input.standard} \
+                --create-output-bam-index false -O results/{wildcards.S}/{wildcards.S}_{wildcards.T}_recal_data.table
+                gatk ApplyBQSR -R {input.ref} -I results/{wildcards.S}/tmp_{wildcards.S}_{wildcards.T}.bam -bqsr results/{wildcards.S}/{wildcards.S}_{wildcards.T}_recal_data.table --create-output-bam-index false \
+                -O results/{wildcards.S}/recalibrated_{wildcards.S}_{wildcards.T}.bam
+                
+                samtools view -h -q 30 -b results/{wildcards.S}/recalibrated_{wildcards.S}_{wildcards.T}.bam > {output} && samtools index {output}
+                """
+rule sequenza:
+        input:
+                normal='results/{S}/{S}_N.bam',
+                tumor='results/{S}/{S}_C.bam',
+                gc='utilities/reference-genomes/GRCh38.primary_assembly.gc50Base.wig.gz',
+                ref=config['ref']['ref_fa']
+        output:
+                seqz='results/{S}/{S}.small.seqz.gz'
+        resources:
+                runtime=300,
+                cpus_per_task=4,
+                mem_mb=16000,
+                account=config['resources']['user_cesga']
+        conda:
+                config['software']['sequenza']
+        shell:
+                """
+                sequenza-utils bam2seqz -n {input.normal} -t {input.tumor} --fasta {input.ref} -gc {input.gc} -o results/{wildcards.S}/{wildcards.S}.seqz.gz
+                sequenza-utils seqz_binning --seqz results/{wildcards.S}/{wildcards.S}.seqz.gz -w 50 -o {output.seqz}
+                """   
+rule hrd_score:
+        input:
+                seqz='results/{S}/{S}.small.seqz.gz',
+                script_hrd=config['scripts']['hrd-score']
+        output:
+                'results/{S}_HRD_score.txt'
+        conda:
+                config['software']['hrd-score']
+        shell:
+                """                
+		$CONDA_PREFIX/bin/Rscript {input.script_hrd} {input.seqz} {output}
+                """
