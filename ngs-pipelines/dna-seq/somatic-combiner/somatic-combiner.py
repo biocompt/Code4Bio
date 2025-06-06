@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 from tqdm import tqdm
 import numpy as np
@@ -23,13 +23,11 @@ def chr_sort_key(chrom):
         return (0, 25)
     return (1, ch)
 
+def simplify_caller_name(caller):
+    """Simplifica nombres de callers quitando todo después del guion"""
+    return caller.split("-")[0]
+
 def parse_filtered_vcf(path):
-    """
-    Lee un VCF filtrado y devuelve:
-      header_lines: todas las líneas que empiezan con "##"
-      column_header: la línea "#CHROM ..." (no se usa para el header final)
-      records: dict mapping (chrom, pos, ref, alt) → (INFO_string, FORMAT_string, [sample_field_strs...])
-    """
     header_lines = []
     column_header = None
     records = {}
@@ -39,6 +37,7 @@ def parse_filtered_vcf(path):
                 header_lines.append(line.rstrip())
             elif line.startswith("#CHROM"):
                 column_header = line.rstrip()
+                samples = line.rstrip().split("\t")[9:]
                 break
         for line in fh:
             if not line.strip() or line.startswith("#"):
@@ -50,78 +49,79 @@ def parse_filtered_vcf(path):
             alt = cols[4]
             info = cols[7]
             fmt = cols[8]
-            samples = cols[9:]
+            sample_data = cols[9:]
+            
+            fmt_keys = fmt.split(":")
+            normal_dict = dict(zip(fmt_keys, sample_data[0].split(":")))
+            tumor_dict = dict(zip(fmt_keys, sample_data[1].split(":"))) if len(sample_data) > 1 else {}
+            
             key = (chrom, pos, ref, alt)
-            records[key] = (info, fmt, samples)
+            records[key] = (info, fmt, normal_dict, tumor_dict)
     return header_lines, column_header, records
 
+def get_consensus_gt(gt_list):
+    if not gt_list:
+        return "."
+    valid_gts = [gt for gt in gt_list if gt not in (".", "./.", ".|.")]
+    if not valid_gts:
+        return "."
+    if all(gt == valid_gts[0] for gt in valid_gts):
+        return valid_gts[0]
+    return "."
+
 def merge_variant_fields(caller_records, key, present_callers):
-    """
-    Combina los campos de una variante para NORMAL y TUMOR a partir de los distintos callers.
-    Para cada caller, toma sus datos de NORMAL y TUMOR (si existen) y promedia DP, AF, GQ, MQ, MQ0.
-    """
-    normal_data = {"GT": ".", "DP": ".", "AF": ".", "GQ": ".", "MQ": ".", "MQ0": "."}
-    tumor_data  = {"GT": ".", "DP": ".", "AF": ".", "GQ": ".", "MQ": ".", "MQ0": "."}
-
+    normal_data = defaultdict(list)
+    tumor_data = defaultdict(list)
+    
+    numeric_fields = ["DP", "AF", "GQ", "MQ", "MQ0"]
+    all_fields = ["GT"] + numeric_fields
+    
     for caller in present_callers:
-        rec_info, rec_fmt, rec_samples = caller_records[caller][key]
-        caller_fmt_keys = rec_fmt.split(":")
-        sample_raw = rec_samples[0].split(":")
-
-        val_map = {caller_fmt_keys[i]: sample_raw[i] for i in range(len(caller_fmt_keys))}
-
-        # Si el caller aporta campos de NORMAL y TUMOR en la misma entrada (asumimos que lo hace)
-        # simplemente actualizamos normal_data y tumor_data con lo que encuentre en val_map.
-        # (Por simplicidad, asumimos que quien llame a esta función sabe qué campos representan a NORMAL/TUMOR,
-        #  pero en tu caso podrías homogeneizar aquí si, por ejemplo, usas un sufijo o prefijo).
-        # En el ejemplo original, cada VCF ya tenía una sola muestra, así que “val_map” corresponde
-        # a la muestra única, que asumimos contiene primero NORMAL y luego TUMOR en diferentes VCF.
-        # Para mantener la lógica general: si val_map contiene esos campos, los asignamos a ambos.
-        # Aquí suponemos: cada caller_proporciona campos para NORMAL y TUMOR en su propia estructura.
-
-        # En la versión original, cada VCF contiene un único “sample” con GT/DP/AF/...,
-        # pero en realidad, es la muestra somática (TUMOR), y no hay campo implícito de NORMAL.
-        # Si quisieras extraer GT:DP:AF de la parte “NORMAL” del VCF, necesitarías parsear cada caller por separado.
-        # Para no complicar, asumimos que “val_map” es directamente la información TUMOR,
-        # y dejamos NORMAL en "." si no hay nada explícito para NORMAL. Sólo promediamos DP/AF
-        # si ese caller ya contiene un campo específico para NORMAL (p.ej. val_map["N_DP"]).
-        # Como el enunciado original no definía diferencia explícita, asumiremos:
-        #   - Cada caller da datos de TUMOR (entendemos que es la muestra “tumor”).
-        #   - Para NORMAL, si el caller tiene esos mismos campos (por convención “N_DP”, “N_AF”, etc.), los usamos.
-        # Como eso no estaba explícito, aquí simplemente copiamos todo a TUMOR y dejamos NORMAL con “.”, 
-        # a menos que val_map tuviera una clave “N_DP”/“N_AF”/etc. (lo dejo preparado, aunque en la mayoría de VCF no exista).
-
-        # Por simplicidad, asignamos todo a tumor_data:
-        for k, v in val_map.items():
-            if k in tumor_data:
-                tumor_data[k] = v
-            # Si llegado el caso hubiera claves como "N_DP", "N_AF", etc., haríamos:
-            # elif k.startswith("N_") y k[2:] en normal_data: 
-            #     normal_data[k[2:]] = v
-
-    # Ahora promediamos los campos compartidos
-    result = {"NORMAL": {}, "TUMOR": {}}
-    for field in ["DP", "AF", "GQ", "MQ", "MQ0"]:
-        n_val = normal_data.get(field, ".")
-        t_val = tumor_data.get(field, ".")
-        if n_val != ".":
-            result["NORMAL"][field] = n_val
-        if t_val != ".":
-            result["TUMOR"][field] = t_val
-        if n_val != "." and t_val != ".":
-            try:
-                mean_val = str(np.mean([float(n_val), float(t_val)]))
-            except ValueError:
-                mean_val = "."
-            result["NORMAL"][field] = mean_val
-            result["TUMOR"][field] = mean_val
-
-    # GT: tomamos directamente el GT de tumor_data (o "." si no existe)
-    result["NORMAL"]["GT"] = normal_data.get("GT", ".")
-    result["TUMOR"]["GT"]  = tumor_data.get("GT", ".")
-
-    # Si faltan campos, ya están en "." por defecto
-    return result
+        info, fmt, normal_dict, tumor_dict = caller_records[caller][key]
+        
+        for field in all_fields:
+            if field in normal_dict and normal_dict[field] != ".":
+                if field == "GT":
+                    normal_data["GT"].append(normal_dict[field])
+                else:
+                    try:
+                        val = float(normal_dict[field])
+                        normal_data[field].append(val)
+                    except ValueError:
+                        pass
+        
+        for field in all_fields:
+            if field in tumor_dict and tumor_dict[field] != ".":
+                if field == "GT":
+                    tumor_data["GT"].append(tumor_dict[field])
+                else:
+                    try:
+                        val = float(tumor_dict[field])
+                        tumor_data[field].append(val)
+                    except ValueError:
+                        pass
+    
+    def process_sample_data(data_dict):
+        result = {}
+        result["GT"] = get_consensus_gt(data_dict.get("GT", []))
+        
+        for field in numeric_fields:
+            values = data_dict.get(field, [])
+            if not values:
+                result[field] = "."
+            else:
+                if field == "AF":
+                    avg = round(np.mean(values), 2)
+                    result[field] = f"{avg:.2f}"
+                else:
+                    avg = int(round(np.mean(values)))
+                    result[field] = str(avg)
+        return result
+    
+    return {
+        "NORMAL": process_sample_data(normal_data),
+        "TUMOR": process_sample_data(tumor_data)
+    }
 
 def main():
     parser = argparse.ArgumentParser(
@@ -144,19 +144,18 @@ def main():
     callers_to_run = []
 
     if args.mutect2:
-        callers_to_run.append(("mutect2", args.mutect2, "filtrar_mutect2", "filter_mutect2"))
+        callers_to_run.append(("mutect2", args.mutect2, "filter_mutect2", "filter_mutect2"))
     if args.muse:
-        callers_to_run.append(("muse", args.muse, "filtrar_muse", "filter_muse"))
+        callers_to_run.append(("muse", args.muse, "filter_muse", "filter_muse"))
     if args.strelka_snvs:
-        callers_to_run.append(("strelka-snvs", args.strelka_snvs, "filtrar_strelka", "filter_strelka"))
+        callers_to_run.append(("strelka-snvs", args.strelka_snvs, "filter_strelka", "filter_strelka"))
     if args.strelka_indels:
-        callers_to_run.append(("strelka-indels", args.strelka_indels, "filtrar_strelka", "filter_strelka"))
+        callers_to_run.append(("strelka-indels", args.strelka_indels, "filter_strelka", "filter_strelka"))
     if args.varscan_snvs:
-        callers_to_run.append(("varscan-snvs", args.varscan_snvs, "filtrar_varscan", "filter_varscan"))
+        callers_to_run.append(("varscan-snvs", args.varscan_snvs, "filter_varscan", "filter_varscan"))
     if args.varscan_indels:
-        callers_to_run.append(("varscan-indels", args.varscan_indels, "filtrar_varscan", "filter_varscan"))
+        callers_to_run.append(("varscan-indels", args.varscan_indels, "filter_varscan", "filter_varscan"))
 
-    # Paso 1: ejecutar filtros
     for caller, input_path, module_name, function_name in callers_to_run:
         base = os.path.basename(input_path)
         stem = base.replace(".vcf.gz", "")
@@ -168,7 +167,6 @@ def main():
         print(f"{timestamp()}  Finished filter for {caller}")
         filtered_paths[caller] = out_path
 
-    # Paso 2: parsear VCFs filtrados
     caller_headers = {}
     caller_records = {}
     all_contigs = OrderedDict()
@@ -179,51 +177,40 @@ def main():
         hdr_lines, col_hdr, recs = parse_filtered_vcf(path)
         caller_headers[caller] = (hdr_lines, col_hdr)
         caller_records[caller] = recs
-        # Recolectamos contigs disponibles (chromosomes)
         for line in hdr_lines:
             if line.startswith("##contig"):
                 contig_id = line.split("ID=")[1].split(">")[0]
                 if contig_id not in all_contigs:
                     all_contigs[contig_id] = line
-        # Recolectamos formatos disponibles (no los usaremos para header, pero sí para construir fmt_union)
         for line in hdr_lines:
             if line.startswith("##FORMAT"):
                 key = line.split("<ID=")[1].split(",")[0]
                 fmt_keys_union.add(key)
         print(f"{timestamp()}  Parsed {len(recs)} variants for {caller}")
 
-    # Paso 3: construir header estático (solo una vez)
     merged_header = [
         "##fileformat=VCFv4.2"
     ]
-
-    # Añadimos los contigs (solo una vez cada uno), ordenados en orden natural
-    # Por convención, incluimos chr1–chr22, chrX, chrY, chrM
     chromos = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY", "chrM"]
     for c in chromos:
         merged_header.append(f"##contig=<ID={c}>")
 
-    # A continuación definimos los campos FORMAT (fijos)
     merged_header.extend([
         '##INFO=<ID=CC,Number=1,Type=Integer,Description="Number of callers supporting variant">',
         '##INFO=<ID=CL,Number=.,Type=String,Description="List of callers supporting variant">',
         '##INFO=<ID=SOMATIC,Number=0,Type=Flag,Description="Indicates if record is a somatic mutation">',
-        '##FORMAT=<ID=AF,Number=A,Type=Float,Description="Allele fractions of alternate alleles in the tumor">',
-        '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Approximate read depth (reads con MQ=255 o con bad mates filtrados)">',
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
-        '##FORMAT=<ID=SB,Number=4,Type=Integer,Description="Per-sample strand-bias statistics">',
-        '##FORMAT=<ID=BQ,Number=.,Type=Integer,Description="Average base quality for reads supporting alleles">',
-        '##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype Quality">',
-        '##FORMAT=<ID=MQ,Number=1,Type=Float,Description="RMS Mapping Quality">',
-        '##FORMAT=<ID=MQ0,Number=1,Type=Integer,Description="Mapping Quality Zero Count">'
+        '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">',
+        '##FORMAT=<ID=AF,Number=A,Type=Float,Description="Allele frequency">',
+        '##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype quality">',
+        '##FORMAT=<ID=MQ,Number=1,Type=Integer,Description="Mapping quality">',
+        '##FORMAT=<ID=MQ0,Number=1,Type=Integer,Description="Count of MAPQ=0 reads">'
     ])
 
-    # LÍNEA DE COLUMNAS (solo una vez)
     column_header = "#" + "\t".join(
         ["CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT", "NORMAL", "TUMOR"]
     )
 
-    # Paso 4: merge de variantes
     print(f"{timestamp()}  Starting merge of variants present in ≥2 callers")
     all_keys = set()
     for recs in caller_records.values():
@@ -234,7 +221,6 @@ def main():
 
     merged_vcf_path = os.path.join(args.output_dir, args.id + ".vcf")
     with open(merged_vcf_path, "w") as out:
-        # Escribimos el header (solo una vez)
         for line in merged_header:
             out.write(line + "\n")
         out.write(column_header + "\n")
@@ -245,19 +231,17 @@ def main():
             if len(present_callers) < 2:
                 continue
 
-            # Merge de campos para NORMAL y TUMOR
             merged_fields = merge_variant_fields(caller_records, key, present_callers)
             normal_data = merged_fields["NORMAL"]
-            tumor_data  = merged_fields["TUMOR"]
+            tumor_data = merged_fields["TUMOR"]
 
-            # Construimos el campo INFO
+            simplified_callers = [simplify_caller_name(c) for c in present_callers]
+            unique_callers = sorted(list(set(simplified_callers)))  # Eliminar duplicados
+            
             info_parts = [
-                f"CC={len(present_callers)}",
-                f"CL={','.join(present_callers)}"
+                f"CC={len(unique_callers)}",
+                f"CL={','.join(unique_callers)}"
             ]
-            # Conservamos la parte "SOMATIC" si alguno de los callers la tiene
-            # (asumimos que al menos uno la tendrá, o la omitimos si no)
-            # Por simplicidad, buscamos "SOMATIC" en los INFO originales:
             for caller in present_callers:
                 caller_info = caller_records[caller][key][0]
                 if "SOMATIC" in caller_info.split(";"):
@@ -266,23 +250,10 @@ def main():
 
             merged_info = ";".join(info_parts)
 
-            # Unión de todos los campos FORMAT que aparezcan en al menos un caller para esta variante
-            present_fmt_keys = set()
-            for caller in present_callers:
-                caller_fmt = caller_records[caller][key][1].split(":")
-                present_fmt_keys.update(caller_fmt)
-
-            # Orden preferente de campos
-            pref_order = ["GT", "DP", "AF", "SB", "GQ", "MQ", "MQ0"]
-            fmt_union = [k for k in pref_order if k in present_fmt_keys]
-            for k in sorted(present_fmt_keys):
-                if k not in fmt_union:
-                    fmt_union.append(k)
-            merged_fmt = ":".join(fmt_union)
-
-            # Ahora construimos los valores para NORMAL y TUMOR según fmt_union
-            normal_vals = [normal_data.get(k, ".") for k in fmt_union]
-            tumor_vals  = [tumor_data.get(k, ".")  for k in fmt_union]
+            fmt_union = ["GT", "DP", "AF", "GQ", "MQ", "MQ0"]
+            
+            normal_vals = [normal_data.get(f, ".") for f in fmt_union]
+            tumor_vals = [tumor_data.get(f, ".") for f in fmt_union]
 
             out.write(
                 "\t".join([
@@ -294,7 +265,7 @@ def main():
                     ".",
                     "PASS",
                     merged_info,
-                    merged_fmt,
+                    ":".join(fmt_union),
                     ":".join(normal_vals),
                     ":".join(tumor_vals)
                 ]) + "\n"
