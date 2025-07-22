@@ -16,3 +16,33 @@ If you're a **student, researcher, or life sciences enthusiast** interested in *
 Start with the introductory tutorials, follow the exercises, and experiment with real datasets. Feel free to **contribute, ask questions, and explore!**  
 
 🚀 Stay curious, keep coding, and happy biohacking! 🧬  
+
+
+
+# Configure Github Repository
+# 1. Initialize the repository
+git init
+
+# 2. Create at least one file (e.g., README.md)
+echo "# Project Name" > README.md
+
+# 3. Stage the file
+git add README.md
+
+# 4. Make the initial commit
+git commit -m "Initial commit"
+
+# 5. Rename the default branch from 'master' to 'main'
+git branch -m main
+
+# 6. Add the remote repository (adjust the URL to yours)
+git remote add origin git@github.com:your-username/your-repo.git
+
+# 7. Push the 'main' branch to the remote and set upstream tracking
+git push -u origin main
+
+
+# Choose ONE of the following options:
+git config --global pull.rebase false     # Default: merge
+git config --global pull.rebase true      # Rebase
+git config --global pull.ff only          # Fast-forward only
