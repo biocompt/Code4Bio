@@ -18,8 +18,7 @@ Start with the introductory tutorials, follow the exercises, and experiment with
 🚀 Stay curious, keep coding, and happy biohacking! 🧬  
 
 
-
-# Configure Github Repository
+## Configure Github Repository
 #### 1. Initialize the repository
 git init
 
@@ -42,7 +41,7 @@ git remote add origin git@github.com:your-username/your-repo.git
 git push -u origin main
 
 
-# Choose ONE of the following options:
+### Choose ONE of the following options:
 git config --global pull.rebase false     # Default: merge
 git config --global pull.rebase true      # Rebase
 git config --global pull.ff only          # Fast-forward only
